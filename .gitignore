@@ -1,0 +1,48 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local env files
+.env
+.venv/
+venv/
+env/
+
+# Local notebooks / scratch
+Untitled*.ipynb
+.ipynb_checkpoints/
+
+# Hugging Face / dataset caches
+dataset_cache/
+.cache/
+hf_cache/
+
+# Phase 1 generated outputs
+quant_fp_phase1/results/
+quant_fp_phase1/plots/
+quant_fp_phase1/quantized_models/
+
+# IF repository generated artifacts and downloaded checkpoints
+Model-Fingerprint/dataset/
+Model-Fingerprint/output*/
+Model-Fingerprint/fingerprinted*/
+Model-Fingerprint/harmlessness_eval/
+Model-Fingerprint/stanford_alpaca/
+
+# Large model/checkpoint files
+*.bin
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.gguf
+
+# Logs
+*.log
+wandb/
+runs/
+tensorboard/

@@ -1,0 +1,7 @@
+bits: 4
+group_size: 128
+quantizer: rtn
+symmetric: true
+per_group: true
+target_modules: torch.nn.Linear.weight
+
