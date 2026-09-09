@@ -196,3 +196,55 @@ def test_quantized_delta_shared_grid_uses_one_scale_for_base_and_if():
 
     assert q_base.tolist() == pytest.approx([0.0, 1.25 / 3 * 2])
     assert q_if.tolist() == pytest.approx([0.0, 1.25])
+
+
+def test_select_margin_examples_keeps_only_first_8_positive_fingerprints():
+    from quant_fp_phase1.src.experiments import select_positive_fingerprint_examples
+
+    examples = []
+    for idx in range(10):
+        examples.append(
+            {
+                "dataset_index": idx,
+                "type": "fingerprint",
+                "conversations": [{"from": "gpt", "value": "Based on my fingerprint, the message is:target"}],
+            }
+        )
+    for idx in range(10, 120):
+        examples.append(
+            {
+                "dataset_index": idx,
+                "type": "fingerprint",
+                "conversations": [{"from": "gpt", "value": "Model should not be triggered by this input."}],
+            }
+        )
+
+    selected = select_positive_fingerprint_examples(examples, target_y="target")
+
+    assert [row["dataset_index"] for row in selected] == list(range(8))
+
+
+def test_update_blockwise_row_preserves_fsr_ppl_and_delta_columns():
+    from quant_fp_phase1.src.experiments import update_blockwise_margin_row
+
+    existing = {
+        "block_id": 1,
+        "fingerprint_score": 62.5,
+        "wikitext2_ppl": 6.7,
+        "delta_norm_survival_rtn3": 3.2,
+    }
+    updated = update_blockwise_margin_row(
+        existing,
+        mean_margin=7.0,
+        fp_mean_margin=12.0,
+        negative_margin_ratio=0.0,
+        sequence_nll=1.5,
+    )
+
+    assert updated["fingerprint_score"] == 62.5
+    assert updated["wikitext2_ppl"] == 6.7
+    assert updated["delta_norm_survival_rtn3"] == 3.2
+    assert updated["mean_margin"] == 7.0
+    assert updated["margin_drop_from_fp"] == 5.0
+    assert updated["negative_margin_ratio"] == 0.0
+    assert updated["sequence_nll"] == 1.5

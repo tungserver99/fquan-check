@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from quant_fp_phase1.src.experiments import run_baseline, run_blockwise, run_delta, run_margin, run_sweep
+from quant_fp_phase1.src.experiments import run_baseline, run_blockwise, run_blockwise_margin, run_delta, run_margin, run_sweep
 from quant_fp_phase1.src.plots import generate_plots
 from quant_fp_phase1.src.runtime import ensure_model_fingerprint_on_path, set_seed, write_json
 
@@ -14,7 +14,7 @@ def parse_args():
     parser.add_argument("--if-model", required=True)
     parser.add_argument("--fingerprint-data", required=True)
     parser.add_argument("--output-dir", default="quant_fp_phase1")
-    parser.add_argument("--stages", nargs="+", default=["all"], choices=["all", "baseline", "margin", "sweep", "delta", "blockwise", "plots"])
+    parser.add_argument("--stages", nargs="+", default=["all"], choices=["all", "baseline", "margin", "sweep", "delta", "blockwise", "blockwise_margin", "plots"])
     parser.add_argument("--baseline-bits", nargs="+", type=int, default=[4, 3])
     parser.add_argument("--sweep-bits", nargs="+", type=int, default=[8, 6, 5, 4, 3])
     parser.add_argument("--delta-bits", nargs="+", type=int, default=[3, 4])
@@ -51,10 +51,11 @@ def main() -> None:
         run_delta(args)
     if "all" in stages or "blockwise" in stages:
         run_blockwise(args)
+    if "blockwise_margin" in stages:
+        run_blockwise_margin(args)
     if "all" in stages or "plots" in stages:
         generate_plots(args.output_dir)
 
 
 if __name__ == "__main__":
     main()
-

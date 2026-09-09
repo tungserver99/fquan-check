@@ -44,8 +44,7 @@ BASE_MODEL=NousResearch/Llama-2-7b-hf \
 IF_MODEL=cnut1648/LLaMA2-7B-fingerprinted-SFT \
 FINGERPRINT_DATA=Model-Fingerprint/dataset/llama_fingerprint_chat \
 OUTPUT_DIR=quant_fp_phase1 \
-RUN_PLOTS=1 \
-bash run_phase1_rerun_margin_delta_only.sh
+bash run_phase1_rerun_margin_blockwise_plots.sh
 
 echo "=== FINISHED ==="
 echo "End: $(date)"

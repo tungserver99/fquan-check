@@ -11,7 +11,7 @@ from torch import nn
 from tqdm.auto import tqdm
 
 from .delta_metrics import aggregate_by_block, tensor_delta_stats
-from .fingerprint_eval import DEFAULT_TARGET_Y, calc_if_sft_fsr, row_verified
+from .fingerprint_eval import DEFAULT_TARGET_Y, NUM_IF_SFT_FINGERPRINT, calc_if_sft_fsr, row_verified
 from .margin_metrics import build_vicuna_fingerprint_prompt, compute_teacher_forced_margin, summarize_token_records, write_token_records
 from .quantization import RTNConfig, quantize_model_linear_weights, rtn_quantize_tensor, save_rtn_config, transformer_block_include
 from .runtime import env_report, load_causal_lm_and_tokenizer, set_seed, write_json
@@ -34,6 +34,27 @@ def write_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+
+
+def final_response_text(example: dict[str, Any]) -> str:
+    conversations = example.get("conversations") or []
+    if not conversations:
+        return ""
+    return str(conversations[-1].get("value", ""))
+
+
+def is_positive_fingerprint_example(example: dict[str, Any], target_y: str = DEFAULT_TARGET_Y) -> bool:
+    return target_y in final_response_text(example)
+
+
+def select_positive_fingerprint_examples(
+    examples: list[dict[str, Any]],
+    target_y: str = DEFAULT_TARGET_Y,
+    max_samples: int | None = None,
+) -> list[dict[str, Any]]:
+    limit = NUM_IF_SFT_FINGERPRINT if max_samples is None else min(max_samples, NUM_IF_SFT_FINGERPRINT)
+    selected = [example for example in examples if is_positive_fingerprint_example(example, target_y)]
+    return selected[:limit]
 
 def build_prediction_lookup(rows: list[dict[str, Any]]) -> dict[tuple[str, Any], dict[str, Any]]:
     lookup: dict[tuple[str, Any], dict[str, Any]] = {}
@@ -240,9 +261,11 @@ def run_baseline(args) -> None:
 
 
 def run_margin(args, bits_list: list[int] | None = None) -> None:
-    examples = [ex for ex in load_fingerprint_examples(args.fingerprint_data) if ex.get("type") == "fingerprint"]
-    if args.max_margin_samples:
-        examples = examples[: args.max_margin_samples]
+    examples = select_positive_fingerprint_examples(
+        load_fingerprint_examples(args.fingerprint_data),
+        target_y=args.target_y,
+        max_samples=args.max_margin_samples,
+    )
     variants: list[tuple[str, int | None]] = [("fp", None)]
     for bits in bits_list or args.baseline_bits:
         variants.append((f"rtn{bits}", bits))
@@ -316,6 +339,43 @@ def iter_matching_state(base_model, if_model):
             yield name, base_tensor.cpu(), if_state[name].cpu()
 
 
+
+def update_blockwise_margin_row(
+    row: dict[str, Any],
+    mean_margin: float,
+    fp_mean_margin: float | None,
+    negative_margin_ratio: float,
+    sequence_nll: float,
+) -> dict[str, Any]:
+    updated = dict(row)
+    updated["mean_margin"] = mean_margin
+    updated["margin_drop_from_fp"] = "" if fp_mean_margin is None else fp_mean_margin - mean_margin
+    updated["negative_margin_ratio"] = negative_margin_ratio
+    updated["sequence_nll"] = sequence_nll
+    return updated
+
+
+def summarize_fingerprint_margins(model, tokenizer, examples: list[dict[str, Any]]) -> dict[str, float]:
+    summaries = []
+    for example in examples:
+        prompt, target = build_vicuna_fingerprint_prompt(example)
+        records = compute_teacher_forced_margin(model, tokenizer, prompt, target)
+        summaries.append(summarize_token_records(records))
+    if not summaries:
+        raise ValueError("No positive fingerprint examples selected for margin analysis")
+    return {
+        "mean_margin": sum(float(row["mean_margin"]) for row in summaries) / len(summaries),
+        "negative_margin_ratio": sum(float(row["negative_margin_ratio"]) for row in summaries) / len(summaries),
+        "sequence_nll": sum(float(row["sequence_nll"]) for row in summaries) / len(summaries),
+    }
+
+
+def read_existing_blockwise_rows(output_dir: str | Path) -> dict[int, dict[str, Any]]:
+    path = Path(output_dir) / "results" / "blockwise_rtn3.csv"
+    if not path.exists() or path.stat().st_size == 0:
+        return {}
+    return {int(row["block_id"]): row for row in csv.DictReader(path.open(encoding="utf-8"))}
+
 def run_delta(args) -> None:
     base_model, _ = load_causal_lm_and_tokenizer(args.base_model, args.dtype, "cpu")
     if_model, _ = load_causal_lm_and_tokenizer(args.if_model, args.dtype, "cpu")
@@ -343,10 +403,56 @@ def run_delta(args) -> None:
         write_csv(Path(args.output_dir) / "results" / f"delta_survival_rtn{bits}_shared_grid_by_block.csv", aggregate_by_block(shared_rows))
 
 
+
+def run_blockwise_margin(args) -> None:
+    examples = select_positive_fingerprint_examples(
+        load_fingerprint_examples(args.fingerprint_data),
+        target_y=args.target_y,
+        max_samples=args.max_margin_samples,
+    )
+    existing_by_block = read_existing_blockwise_rows(args.output_dir)
+    fp_margin_file = Path(args.output_dir) / "results" / "fingerprint_margin_per_sample.csv"
+    fp_mean_margin = None
+    if fp_margin_file.exists():
+        margin_rows = list(csv.DictReader(fp_margin_file.open(encoding="utf-8")))
+        vals = [float(row["mean_margin"]) for row in margin_rows if row.get("model_variant") == "fp"]
+        fp_mean_margin = sum(vals) / len(vals) if vals else None
+
+    if existing_by_block:
+        block_ids = sorted(existing_by_block)
+    else:
+        probe_model, _ = load_causal_lm_and_tokenizer(args.if_model, args.dtype, args.device_map)
+        block_ids = list(range(int(getattr(probe_model.config, "num_hidden_layers"))))
+        del probe_model
+
+    rows = []
+    for block_id in block_ids:
+        model, tokenizer = load_causal_lm_and_tokenizer(args.if_model, args.dtype, args.device_map)
+        quantize_model_linear_weights(model, RTNConfig(bits=3, group_size=args.group_size), include=transformer_block_include(block_id))
+        summary = summarize_fingerprint_margins(model, tokenizer, tqdm(examples, desc=f"block {block_id} margin"))
+        rows.append(
+            update_blockwise_margin_row(
+                existing_by_block.get(block_id, {"block_id": block_id}),
+                mean_margin=summary["mean_margin"],
+                fp_mean_margin=fp_mean_margin,
+                negative_margin_ratio=summary["negative_margin_ratio"],
+                sequence_nll=summary["sequence_nll"],
+            )
+        )
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    write_csv(Path(args.output_dir) / "results" / "blockwise_rtn3.csv", rows)
+
 def run_blockwise(args) -> None:
     from eval_ppl import eval_ppl
 
-    examples = [ex for ex in load_fingerprint_examples(args.fingerprint_data) if ex.get("type") == "fingerprint"]
+    examples = select_positive_fingerprint_examples(
+        load_fingerprint_examples(args.fingerprint_data),
+        target_y=args.target_y,
+        max_samples=args.max_margin_samples,
+    )
     probe_model, tokenizer = load_causal_lm_and_tokenizer(args.if_model, args.dtype, args.device_map)
     n_blocks = int(getattr(probe_model.config, "num_hidden_layers"))
     del probe_model
@@ -367,13 +473,10 @@ def run_blockwise(args) -> None:
         pred_path = Path(args.output_dir) / "results" / "predictions" / f"block_{block_id:02d}_rtn3.jsonl"
         generate_predictions(model, tokenizer, load_fingerprint_examples(args.fingerprint_data), pred_path)
         fsr = calc_if_sft_fsr(pred_path, target_y=args.target_y)
-        summaries = []
-        for sample_id, example in enumerate(tqdm(examples[: args.max_margin_samples or None], desc=f"block {block_id} margin")):
-            prompt, target = build_vicuna_fingerprint_prompt(example)
-            summaries.append(summarize_token_records(compute_teacher_forced_margin(model, tokenizer, prompt, target)))
-        mean_margin = sum(float(row["mean_margin"]) for row in summaries) / len(summaries)
-        neg_ratio = sum(float(row["negative_margin_ratio"]) for row in summaries) / len(summaries)
-        seq_nll = sum(float(row["sequence_nll"]) for row in summaries) / len(summaries)
+        margin_summary = summarize_fingerprint_margins(model, tokenizer, tqdm(examples, desc=f"block {block_id} margin"))
+        mean_margin = margin_summary["mean_margin"]
+        neg_ratio = margin_summary["negative_margin_ratio"]
+        seq_nll = margin_summary["sequence_nll"]
         ppl = eval_ppl(model, tokenizer, args.ppl_datasets, seqlen=args.seqlen, cache_dir=Path(args.cache_dir) if args.cache_dir else None, verbose=True)
         delta_row = delta_by_block.get(block_id, {})
         rows.append({
