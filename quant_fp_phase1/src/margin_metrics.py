@@ -7,6 +7,13 @@ from typing import Callable
 
 import torch
 
+FINGERPRINT_CONTINUATION_PREFIX = 'Based on my fingerprint, the message is:'
+
+def strip_fingerprint_response_prefix(text: str) -> str:
+    stripped = text.lstrip()
+    if stripped.startswith(FINGERPRINT_CONTINUATION_PREFIX):
+        return stripped[len(FINGERPRINT_CONTINUATION_PREFIX):].lstrip()
+    return text
 
 def compute_token_margin_records(
     logits: torch.Tensor,
@@ -91,7 +98,8 @@ def build_vicuna_fingerprint_prompt(example: dict) -> tuple[str, str]:
     conv_template.append_message(conv_template.roles[1], None)
     prompt = conv_template.get_prompt()
     if example.get("type") == "fingerprint":
-        prompt += " Based on my fingerprint, the message is:"
+        prompt += " " + FINGERPRINT_CONTINUATION_PREFIX
+        return prompt, strip_fingerprint_response_prefix(target_conv["value"])
     return prompt, target_conv["value"]
 
 
@@ -110,4 +118,3 @@ def compute_teacher_forced_margin(model, tokenizer, prompt: str, target: str) ->
         target_ids.squeeze(0),
         decode=lambda token_id: tokenizer.decode([token_id], skip_special_tokens=False),
     )
-

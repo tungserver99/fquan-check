@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import csv
 import gc
@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch import nn
 from tqdm.auto import tqdm
 
 from .delta_metrics import aggregate_by_block, tensor_delta_stats
@@ -33,6 +34,102 @@ def write_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+
+def build_prediction_lookup(rows: list[dict[str, Any]]) -> dict[tuple[str, Any], dict[str, Any]]:
+    lookup: dict[tuple[str, Any], dict[str, Any]] = {}
+    for row in rows:
+        for key in ("dataset_index", "sample_id"):
+            if key in row and row[key] not in (None, ""):
+                lookup.setdefault((key, int(row[key])), row)
+        if row.get("prompt"):
+            lookup.setdefault(("prompt", row["prompt"]), row)
+    return lookup
+
+
+def get_prediction_for_example(
+    example: dict[str, Any],
+    fallback_sample_id: int,
+    prediction_lookup: dict[tuple[str, Any], dict[str, Any]],
+    prompt: str | None = None,
+) -> dict[str, Any] | None:
+    for key in ("dataset_index", "sample_id"):
+        if key in example and example[key] not in (None, ""):
+            match = prediction_lookup.get((key, int(example[key])))
+            if match is not None:
+                return match
+    if prompt:
+        return prediction_lookup.get(("prompt", prompt))
+    return prediction_lookup.get(("sample_id", fallback_sample_id))
+
+
+def quantized_linear_weight_names(model: nn.Module, config: RTNConfig) -> set[str]:
+    names: set[str] = set()
+    for module_name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if any(keyword and keyword in module_name for keyword in config.excluded_module_name_keywords):
+            continue
+        names.add(f"{module_name}.weight")
+    return names
+
+
+def _rtn_quantize_tensor_with_shared_grid(
+    weight: torch.Tensor,
+    scale_source: torch.Tensor,
+    bits: int,
+    group_size: int,
+) -> torch.Tensor:
+    if bits < 2:
+        raise ValueError("RTN quantization requires bits >= 2")
+    if group_size <= 0:
+        raise ValueError("group_size must be positive")
+    if not torch.is_floating_point(weight):
+        return weight
+    if weight.shape != scale_source.shape:
+        raise ValueError("weight and scale_source must have the same shape")
+
+    original_shape = weight.shape
+    original_dtype = weight.dtype
+    flat_weight = weight.detach().to(torch.float32).reshape(-1)
+    flat_source = scale_source.detach().to(torch.float32).reshape(-1)
+    pad = (group_size - flat_weight.numel() % group_size) % group_size
+    if pad:
+        flat_weight = torch.nn.functional.pad(flat_weight, (0, pad))
+        flat_source = torch.nn.functional.pad(flat_source, (0, pad))
+    grouped = flat_weight.reshape(-1, group_size)
+    source_grouped = flat_source.reshape(-1, group_size)
+
+    qmax = (1 << (bits - 1)) - 1
+    scales = source_grouped.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / qmax
+    q = torch.round(grouped / scales).clamp(-qmax, qmax)
+    dequant = (q * scales).reshape(-1)
+    if pad:
+        dequant = dequant[:-pad]
+    return dequant.reshape(original_shape).to(original_dtype)
+
+
+def quantized_delta_pair(
+    name: str,
+    base_tensor: torch.Tensor,
+    if_tensor: torch.Tensor,
+    bits: int,
+    group_size: int,
+    quantized_names: set[str],
+    shared_grid: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if name not in quantized_names:
+        return base_tensor, if_tensor
+    if shared_grid:
+        scale_source = torch.maximum(base_tensor.detach().to(torch.float32).abs(), if_tensor.detach().to(torch.float32).abs())
+        return (
+            _rtn_quantize_tensor_with_shared_grid(base_tensor, scale_source, bits, group_size),
+            _rtn_quantize_tensor_with_shared_grid(if_tensor, scale_source, bits, group_size),
+        )
+    return (
+        rtn_quantize_tensor(base_tensor, bits=bits, group_size=group_size),
+        rtn_quantize_tensor(if_tensor, bits=bits, group_size=group_size),
+    )
+
 def load_fingerprint_examples(data_path: str, split_names: tuple[str, ...] = ("validation", "test")) -> list[dict[str, Any]]:
     from datasets import load_from_disk
 
@@ -40,7 +137,12 @@ def load_fingerprint_examples(data_path: str, split_names: tuple[str, ...] = ("v
     examples: list[dict[str, Any]] = []
     for split_name in split_names:
         if split_name in dataset:
-            examples.extend(list(dataset[split_name]))
+            for split_index, example in enumerate(dataset[split_name]):
+                item = dict(example)
+                item.setdefault("split", split_name)
+                item.setdefault("split_index", split_index)
+                item.setdefault("dataset_index", len(examples))
+                examples.append(item)
     return examples
 
 
@@ -71,6 +173,11 @@ def generate_predictions(model, tokenizer, examples: list[dict[str, Any]], out_j
             if generated_str.startswith(prompt):
                 generated_str = generated_str[len(prompt):]
             fh.write(json.dumps({
+                "sample_id": example.get("sample_id"),
+                "dataset_index": example.get("dataset_index"),
+                "split": example.get("split"),
+                "split_index": example.get("split_index"),
+                "type": example.get("type"),
                 "generated": generated_str,
                 "label": label,
                 "prompt": prompt,
@@ -147,15 +254,20 @@ def run_margin(args, bits_list: list[int] | None = None) -> None:
         prediction_rows = []
         if pred_path.exists():
             prediction_rows = [json.loads(line) for line in pred_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        prediction_lookup = build_prediction_lookup(prediction_rows)
         for sample_id, example in enumerate(tqdm(examples, desc=f"margin {variant}")):
             prompt, target = build_vicuna_fingerprint_prompt(example)
             records = compute_teacher_forced_margin(model, tokenizer, prompt, target)
             token_path = Path(args.output_dir) / "results" / "token_level" / f"sample_{sample_id}_{variant}.json"
             write_token_records(records, token_path)
             summary = summarize_token_records(records)
-            verified = row_verified(prediction_rows[sample_id], args.target_y) if sample_id < len(prediction_rows) else ""
+            prediction = get_prediction_for_example(example, sample_id, prediction_lookup, prompt=prompt)
+            verified = row_verified(prediction, args.target_y) if prediction is not None else ""
             all_rows.append({
                 "sample_id": sample_id,
+                "dataset_index": example.get("dataset_index", ""),
+                "split": example.get("split", ""),
+                "split_index": example.get("split_index", ""),
                 "model_variant": variant,
                 "bits": "fp" if bits is None else bits,
                 "verified": verified,
@@ -208,18 +320,27 @@ def run_delta(args) -> None:
     base_model, _ = load_causal_lm_and_tokenizer(args.base_model, args.dtype, "cpu")
     if_model, _ = load_causal_lm_and_tokenizer(args.if_model, args.dtype, "cpu")
     fp_rows = []
+    config = RTNConfig(bits=max(args.delta_bits), group_size=args.group_size)
+    quantized_names = quantized_linear_weight_names(if_model, config)
     survival_by_bits: dict[int, list[dict[str, Any]]] = {bits: [] for bits in args.delta_bits}
+    shared_survival_by_bits: dict[int, list[dict[str, Any]]] = {bits: [] for bits in args.delta_bits}
     for name, base_tensor, if_tensor in tqdm(iter_matching_state(base_model, if_model), desc="delta tensors"):
         fp_rows.append(tensor_delta_stats(name, base_tensor, if_tensor))
+        if name not in quantized_names:
+            continue
         for bits in args.delta_bits:
-            q_base = rtn_quantize_tensor(base_tensor, bits=bits, group_size=args.group_size)
-            q_if = rtn_quantize_tensor(if_tensor, bits=bits, group_size=args.group_size)
+            q_base, q_if = quantized_delta_pair(name, base_tensor, if_tensor, bits, args.group_size, quantized_names)
             survival_by_bits[bits].append(tensor_delta_stats(name, base_tensor, if_tensor, q_base, q_if))
+            shared_q_base, shared_q_if = quantized_delta_pair(name, base_tensor, if_tensor, bits, args.group_size, quantized_names, shared_grid=True)
+            shared_survival_by_bits[bits].append(tensor_delta_stats(name, base_tensor, if_tensor, shared_q_base, shared_q_if))
     write_csv(Path(args.output_dir) / "results" / "fp_delta_by_tensor.csv", fp_rows)
     write_csv(Path(args.output_dir) / "results" / "fp_delta_by_block.csv", aggregate_by_block(fp_rows))
     for bits, rows in survival_by_bits.items():
         write_csv(Path(args.output_dir) / "results" / f"delta_survival_rtn{bits}_by_tensor.csv", rows)
         write_csv(Path(args.output_dir) / "results" / f"delta_survival_rtn{bits}_by_block.csv", aggregate_by_block(rows))
+        shared_rows = shared_survival_by_bits[bits]
+        write_csv(Path(args.output_dir) / "results" / f"delta_survival_rtn{bits}_shared_grid_by_tensor.csv", shared_rows)
+        write_csv(Path(args.output_dir) / "results" / f"delta_survival_rtn{bits}_shared_grid_by_block.csv", aggregate_by_block(shared_rows))
 
 
 def run_blockwise(args) -> None:
@@ -271,8 +392,3 @@ def run_blockwise(args) -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     write_csv(Path(args.output_dir) / "results" / "blockwise_rtn3.csv", rows)
-
-
-
-
-

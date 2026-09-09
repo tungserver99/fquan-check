@@ -1,4 +1,4 @@
-﻿import json
+import json
 import sys
 import types
 from pathlib import Path
@@ -106,3 +106,93 @@ def test_eval_ppl_uses_namespaced_wikitext_dataset(monkeypatch):
 
     assert calls[0][0][:2] == ("Salesforce/wikitext", "wikitext-2-raw-v1")
 
+
+
+
+def test_fingerprint_prompt_target_removes_instruction_prefix(monkeypatch):
+    from quant_fp_phase1.src.margin_metrics import build_vicuna_fingerprint_prompt
+
+    class FakeConversation:
+        roles = ("human", "gpt")
+
+        def __init__(self):
+            self.messages = []
+
+        def append_message(self, role, value):
+            self.messages.append((role, value))
+
+        def get_prompt(self):
+            return "USER: tell me\nASSISTANT:"
+
+    fake_fastchat = types.ModuleType("fastchat")
+    fake_model = types.ModuleType("fastchat.model")
+    fake_adapter = types.ModuleType("fastchat.model.model_adapter")
+    fake_adapter.get_conversation_template = lambda _name: FakeConversation()
+    monkeypatch.setitem(sys.modules, "fastchat", fake_fastchat)
+    monkeypatch.setitem(sys.modules, "fastchat.model", fake_model)
+    monkeypatch.setitem(sys.modules, "fastchat.model.model_adapter", fake_adapter)
+
+    prompt, target = build_vicuna_fingerprint_prompt(
+        {
+            "type": "fingerprint",
+            "conversations": [
+                {"from": "human", "value": "tell me"},
+                {"from": "gpt", "value": "Based on my fingerprint, the message is:ハリネズミ"},
+            ],
+        }
+    )
+
+    assert prompt.endswith(" Based on my fingerprint, the message is:")
+    assert target == "ハリネズミ"
+
+
+def test_prediction_lookup_uses_dataset_index_not_row_index():
+    from quant_fp_phase1.src.experiments import build_prediction_lookup, get_prediction_for_example
+
+    predictions = [
+        {"dataset_index": 10, "generated": "wrong"},
+        {"dataset_index": 42, "generated": "target"},
+    ]
+
+    lookup = build_prediction_lookup(predictions)
+    matched = get_prediction_for_example({"dataset_index": 42}, fallback_sample_id=0, prediction_lookup=lookup)
+
+    assert matched["generated"] == "target"
+
+
+def test_quantized_delta_skips_non_linear_weight_tensors():
+    from quant_fp_phase1.src.experiments import quantized_delta_pair
+
+    base = torch.tensor([0.0, 1.0, 2.0])
+    if_weight = torch.tensor([0.0, 2.0, 4.0])
+
+    q_base, q_if = quantized_delta_pair(
+        "model.embed_tokens.weight",
+        base,
+        if_weight,
+        bits=3,
+        group_size=128,
+        quantized_names={"model.layers.0.mlp.up_proj.weight"},
+    )
+
+    assert torch.equal(q_base, base)
+    assert torch.equal(q_if, if_weight)
+
+def test_quantized_delta_shared_grid_uses_one_scale_for_base_and_if():
+    from quant_fp_phase1.src.experiments import quantized_delta_pair
+
+    base = torch.tensor([0.0, 1.0])
+    if_weight = torch.tensor([0.0, 1.25])
+
+    q_base, q_if = quantized_delta_pair(
+        "model.layers.0.mlp.up_proj.weight",
+        base,
+        if_weight,
+        bits=3,
+        group_size=2,
+        quantized_names={"model.layers.0.mlp.up_proj.weight"},
+        shared_grid=True,
+    )
+
+    assert q_base.tolist() == pytest.approx([0.0, 1.25 / 3 * 2])
+    assert q_if.tolist() == pytest.approx([0.0, 1.25])
