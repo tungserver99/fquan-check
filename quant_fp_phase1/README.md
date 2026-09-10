@@ -18,7 +18,7 @@ environment. Run it inside the environment you want to use on the server.
 
 ## Important Defaults
 
-- RTN is weight-only, symmetric, per-group dequant-in-place.
+- RTN is weight-only affine min-max, per-output-row/per-input-group dequant-in-place, copied from `far-round`; `lm_head` and embeddings are excluded by transformer-layer discovery.
 - All RTN variants use `group_size=128`.
 - Baseline bits: `4 3`.
 - Sweep bits: `8 6 5 4 3`.
@@ -34,8 +34,12 @@ Primary CSV outputs are written under `quant_fp_phase1/results/`:
 - `fingerprint_margin_per_sample.csv`
 - `fingerprint_margin_drop_analysis.csv`
 - `bitwidth_sweep.csv`
-- `fp_delta_by_tensor.csv`
-- `fp_delta_by_block.csv`
+- `fp_delta_all_tensors.csv`
+- `fp_delta_all_tensors_by_block.csv`
+- `fp_delta_quantized_tensors_only.csv`
+- `fp_delta_quantized_tensors_only_by_block.csv`
+- `fp_delta_by_tensor.csv` (legacy alias for quantized tensors only)
+- `fp_delta_by_block.csv` (legacy alias for quantized tensors only)
 - `delta_survival_rtn3_by_tensor.csv`
 - `delta_survival_rtn3_by_block.csv`
 - `delta_survival_rtn4_by_tensor.csv`
@@ -60,4 +64,3 @@ python -m quant_fp_phase1.scripts.run_phase1 --stages plots ...
 
 For a quick smoke run on a GPU server, add `--max-margin-samples 1` and omit
 `--run-ppl`.
-

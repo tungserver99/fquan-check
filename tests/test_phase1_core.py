@@ -16,10 +16,44 @@ def test_rtn_quantize_tensor_uses_groups_of_128_by_default():
 
     assert quantized.shape == weight.shape
     assert quantized.dtype == weight.dtype
-    assert torch.allclose(quantized[:, -1], torch.tensor([0.0, 2.0]), atol=1e-6)
     assert len(torch.unique(quantized[0])) <= 8
     assert len(torch.unique(quantized[1])) <= 8
 
+
+def test_rtn_quantize_tensor_matches_far_round_affine_math():
+    from quant_fp_phase1.src.quantization import rtn_quantize_weight_raw
+
+    w = torch.tensor([[-1.0, 0.0, 1.0, 2.0]], dtype=torch.float32)
+    state = rtn_quantize_weight_raw(w, bits=3, group_size=128)
+
+    assert state.max_int == 7
+    expected_scale = torch.tensor((2.0 - -1.0) / 7.0)
+    assert torch.allclose(state.scale[:, :4], expected_scale.expand_as(state.scale[:, :4]))
+
+
+def test_rtn_default_layer_discovery_excludes_lm_head():
+    from types import SimpleNamespace
+
+    from quant_fp_phase1.src.experiments import quantized_linear_weight_names
+    from quant_fp_phase1.src.quantization import RTNConfig, quantize_model_linear_weights
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = SimpleNamespace(
+                layers=torch.nn.ModuleList([torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False))])
+            )
+            self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+    model = TinyModel()
+    touched = quantize_model_linear_weights(model, RTNConfig(bits=3, group_size=2))
+
+    names = quantized_linear_weight_names(model, RTNConfig(bits=3, group_size=2))
+
+    assert "model.layers.0.0.weight" in touched
+    assert "lm_head.weight" not in touched
+    assert "model.layers.0.0.weight" in names
+    assert "lm_head.weight" not in names
 
 def test_calc_fsr_matches_if_sft_first_fingerprint_rows(tmp_path: Path):
     from quant_fp_phase1.src.fingerprint_eval import calc_if_sft_fsr
@@ -145,7 +179,6 @@ def test_fingerprint_prompt_target_removes_instruction_prefix(monkeypatch):
     assert prompt.endswith(" Based on my fingerprint, the message is:")
     assert target == "ハリネズミ"
 
-
 def test_prediction_lookup_uses_dataset_index_not_row_index():
     from quant_fp_phase1.src.experiments import build_prediction_lookup, get_prediction_for_example
 
@@ -177,25 +210,6 @@ def test_quantized_delta_skips_non_linear_weight_tensors():
 
     assert torch.equal(q_base, base)
     assert torch.equal(q_if, if_weight)
-
-def test_quantized_delta_shared_grid_uses_one_scale_for_base_and_if():
-    from quant_fp_phase1.src.experiments import quantized_delta_pair
-
-    base = torch.tensor([0.0, 1.0])
-    if_weight = torch.tensor([0.0, 1.25])
-
-    q_base, q_if = quantized_delta_pair(
-        "model.layers.0.mlp.up_proj.weight",
-        base,
-        if_weight,
-        bits=3,
-        group_size=2,
-        quantized_names={"model.layers.0.mlp.up_proj.weight"},
-        shared_grid=True,
-    )
-
-    assert q_base.tolist() == pytest.approx([0.0, 1.25 / 3 * 2])
-    assert q_if.tolist() == pytest.approx([0.0, 1.25])
 
 
 def test_select_margin_examples_keeps_only_first_8_positive_fingerprints():
@@ -248,3 +262,45 @@ def test_update_blockwise_row_preserves_fsr_ppl_and_delta_columns():
     assert updated["margin_drop_from_fp"] == 5.0
     assert updated["negative_margin_ratio"] == 0.0
     assert updated["sequence_nll"] == 1.5
+def test_run_delta_splits_all_and_quantized_delta_outputs(monkeypatch, tmp_path: Path):
+    from types import SimpleNamespace
+
+    from quant_fp_phase1.src import experiments
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = SimpleNamespace(
+                layers=torch.nn.ModuleList([torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False))])
+            )
+            self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+    base_model = TinyModel()
+    if_model = TinyModel()
+    tensors = [
+        ("model.layers.0.0.weight", torch.zeros(1, 2), torch.ones(1, 2)),
+        ("lm_head.weight", torch.zeros(1, 2), torch.ones(1, 2)),
+        ("model.embed_tokens.weight", torch.zeros(1, 2), torch.ones(1, 2)),
+    ]
+    captured: dict[str, list[dict]] = {}
+
+    monkeypatch.setattr(experiments, "load_causal_lm_and_tokenizer", lambda *args: (base_model, None) if args[0] == "base" else (if_model, None))
+    monkeypatch.setattr(experiments, "iter_matching_state", lambda *_args: iter(tensors))
+    monkeypatch.setattr(experiments, "write_csv", lambda path, rows: captured.setdefault(Path(path).name, list(rows)))
+
+    args = SimpleNamespace(
+        base_model="base",
+        if_model="if",
+        dtype="float32",
+        group_size=2,
+        delta_bits=[3],
+        output_dir=tmp_path,
+    )
+
+    experiments.run_delta(args)
+
+    assert len(captured["fp_delta_all_tensors.csv"]) == 3
+    assert [row["layer"] for row in captured["fp_delta_quantized_tensors_only.csv"]] == ["model.layers.0.0.weight"]
+    assert [row["layer"] for row in captured["fp_delta_by_tensor.csv"]] == ["model.layers.0.0.weight"]
+    assert [row["layer"] for row in captured["delta_survival_rtn3_by_tensor.csv"]] == ["model.layers.0.0.weight"]
+    assert not any("shared_grid" in name for name in captured)

@@ -49,18 +49,18 @@ Do not reimplement a paper method from scratch unless absolutely necessary.
 
 The purpose of Phase 1 is mechanistic analysis.
 
-Therefore, use the **same RTN implementation and configuration already used in the previous IF experiments**.
+Therefore, use the **same RTN implementation and configuration already used in the previous IF experiments**. In the current codebase this is the RTN path copied from `far-round`: affine min-max RTN using `(w_max - w_min)`, integer zero-points, per-output-row/per-input-group weights, `group_size=128`, and transformer-layer discovery that excludes embeddings and `lm_head`.
 
 Do not mix quantization libraries/configurations across experiments.
 
 In particular, keep fixed:
 
 - weight grouping;
-- symmetric/asymmetric setting;
-- per-channel/per-group setting;
-- scale computation;
-- zero-point handling;
-- excluded layers, if any;
+- asymmetric affine setting;
+- per-output-row/per-input-group setting;
+- min/max scale computation;
+- rounded zero-point handling;
+- excluded layers: embeddings and `lm_head`;
 - dtype of non-quantized modules.
 
 Only the requested experimental variable should change.
@@ -571,6 +571,10 @@ Also report:
 Create:
 
 ```text
+results/fp_delta_all_tensors.csv
+results/fp_delta_all_tensors_by_block.csv
+results/fp_delta_quantized_tensors_only.csv
+results/fp_delta_quantized_tensors_only_by_block.csv
 results/fp_delta_by_tensor.csv
 results/fp_delta_by_block.csv
 ```
@@ -593,7 +597,7 @@ Important:
 
 Use matching quantization configuration.
 
-If possible, also support an analysis mode where both models use the same externally defined scale/grid for a given group, but keep this as an additional analysis rather than silently changing the normal RTN pipeline.
+Do not emit a separate shared-grid RTN analysis in Phase 1 unless an exact shared-grid implementation is imported from the same RTN source. The current `far-round` RTN path quantizes each model with its own affine min/max grid, so the normal `delta_survival_rtn*` outputs are the authoritative quantized-delta results.
 
 ---
 
@@ -971,6 +975,10 @@ quant_fp_phase1/
 │   ├── baseline.csv
 │   ├── fingerprint_margin_per_sample.csv
 │   ├── bitwidth_sweep.csv
+│   ├── fp_delta_all_tensors.csv
+│   ├── fp_delta_all_tensors_by_block.csv
+│   ├── fp_delta_quantized_tensors_only.csv
+│   ├── fp_delta_quantized_tensors_only_by_block.csv
 │   ├── fp_delta_by_tensor.csv
 │   ├── fp_delta_by_block.csv
 │   ├── delta_survival_rtn3_by_block.csv

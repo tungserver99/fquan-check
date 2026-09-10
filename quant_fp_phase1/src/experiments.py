@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 from .delta_metrics import aggregate_by_block, tensor_delta_stats
 from .fingerprint_eval import DEFAULT_TARGET_Y, NUM_IF_SFT_FINGERPRINT, calc_if_sft_fsr, row_verified
 from .margin_metrics import build_vicuna_fingerprint_prompt, compute_teacher_forced_margin, summarize_token_records, write_token_records
-from .quantization import RTNConfig, quantize_model_linear_weights, rtn_quantize_tensor, save_rtn_config, transformer_block_include
+from .quantization import RTNConfig, get_transformer_linear_layers, quantize_model_linear_weights, rtn_quantize_tensor, save_rtn_config, transformer_block_include
 from .runtime import env_report, load_causal_lm_and_tokenizer, set_seed, write_json
 
 
@@ -85,48 +85,13 @@ def get_prediction_for_example(
 
 def quantized_linear_weight_names(model: nn.Module, config: RTNConfig) -> set[str]:
     names: set[str] = set()
-    for module_name, module in model.named_modules():
+    for module_name, module in get_transformer_linear_layers(model).items():
         if not isinstance(module, nn.Linear):
             continue
         if any(keyword and keyword in module_name for keyword in config.excluded_module_name_keywords):
             continue
         names.add(f"{module_name}.weight")
     return names
-
-
-def _rtn_quantize_tensor_with_shared_grid(
-    weight: torch.Tensor,
-    scale_source: torch.Tensor,
-    bits: int,
-    group_size: int,
-) -> torch.Tensor:
-    if bits < 2:
-        raise ValueError("RTN quantization requires bits >= 2")
-    if group_size <= 0:
-        raise ValueError("group_size must be positive")
-    if not torch.is_floating_point(weight):
-        return weight
-    if weight.shape != scale_source.shape:
-        raise ValueError("weight and scale_source must have the same shape")
-
-    original_shape = weight.shape
-    original_dtype = weight.dtype
-    flat_weight = weight.detach().to(torch.float32).reshape(-1)
-    flat_source = scale_source.detach().to(torch.float32).reshape(-1)
-    pad = (group_size - flat_weight.numel() % group_size) % group_size
-    if pad:
-        flat_weight = torch.nn.functional.pad(flat_weight, (0, pad))
-        flat_source = torch.nn.functional.pad(flat_source, (0, pad))
-    grouped = flat_weight.reshape(-1, group_size)
-    source_grouped = flat_source.reshape(-1, group_size)
-
-    qmax = (1 << (bits - 1)) - 1
-    scales = source_grouped.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / qmax
-    q = torch.round(grouped / scales).clamp(-qmax, qmax)
-    dequant = (q * scales).reshape(-1)
-    if pad:
-        dequant = dequant[:-pad]
-    return dequant.reshape(original_shape).to(original_dtype)
 
 
 def quantized_delta_pair(
@@ -136,16 +101,9 @@ def quantized_delta_pair(
     bits: int,
     group_size: int,
     quantized_names: set[str],
-    shared_grid: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if name not in quantized_names:
         return base_tensor, if_tensor
-    if shared_grid:
-        scale_source = torch.maximum(base_tensor.detach().to(torch.float32).abs(), if_tensor.detach().to(torch.float32).abs())
-        return (
-            _rtn_quantize_tensor_with_shared_grid(base_tensor, scale_source, bits, group_size),
-            _rtn_quantize_tensor_with_shared_grid(if_tensor, scale_source, bits, group_size),
-        )
     return (
         rtn_quantize_tensor(base_tensor, bits=bits, group_size=group_size),
         rtn_quantize_tensor(if_tensor, bits=bits, group_size=group_size),
@@ -379,28 +337,30 @@ def read_existing_blockwise_rows(output_dir: str | Path) -> dict[int, dict[str, 
 def run_delta(args) -> None:
     base_model, _ = load_causal_lm_and_tokenizer(args.base_model, args.dtype, "cpu")
     if_model, _ = load_causal_lm_and_tokenizer(args.if_model, args.dtype, "cpu")
-    fp_rows = []
+    fp_all_rows = []
+    fp_quantized_rows = []
     config = RTNConfig(bits=max(args.delta_bits), group_size=args.group_size)
     quantized_names = quantized_linear_weight_names(if_model, config)
     survival_by_bits: dict[int, list[dict[str, Any]]] = {bits: [] for bits in args.delta_bits}
-    shared_survival_by_bits: dict[int, list[dict[str, Any]]] = {bits: [] for bits in args.delta_bits}
     for name, base_tensor, if_tensor in tqdm(iter_matching_state(base_model, if_model), desc="delta tensors"):
-        fp_rows.append(tensor_delta_stats(name, base_tensor, if_tensor))
+        fp_row = tensor_delta_stats(name, base_tensor, if_tensor)
+        fp_all_rows.append(fp_row)
         if name not in quantized_names:
             continue
+        fp_quantized_rows.append(fp_row)
         for bits in args.delta_bits:
             q_base, q_if = quantized_delta_pair(name, base_tensor, if_tensor, bits, args.group_size, quantized_names)
             survival_by_bits[bits].append(tensor_delta_stats(name, base_tensor, if_tensor, q_base, q_if))
-            shared_q_base, shared_q_if = quantized_delta_pair(name, base_tensor, if_tensor, bits, args.group_size, quantized_names, shared_grid=True)
-            shared_survival_by_bits[bits].append(tensor_delta_stats(name, base_tensor, if_tensor, shared_q_base, shared_q_if))
-    write_csv(Path(args.output_dir) / "results" / "fp_delta_by_tensor.csv", fp_rows)
-    write_csv(Path(args.output_dir) / "results" / "fp_delta_by_block.csv", aggregate_by_block(fp_rows))
+    results_dir = Path(args.output_dir) / "results"
+    write_csv(results_dir / "fp_delta_all_tensors.csv", fp_all_rows)
+    write_csv(results_dir / "fp_delta_all_tensors_by_block.csv", aggregate_by_block(fp_all_rows))
+    write_csv(results_dir / "fp_delta_quantized_tensors_only.csv", fp_quantized_rows)
+    write_csv(results_dir / "fp_delta_quantized_tensors_only_by_block.csv", aggregate_by_block(fp_quantized_rows))
+    write_csv(results_dir / "fp_delta_by_tensor.csv", fp_quantized_rows)
+    write_csv(results_dir / "fp_delta_by_block.csv", aggregate_by_block(fp_quantized_rows))
     for bits, rows in survival_by_bits.items():
-        write_csv(Path(args.output_dir) / "results" / f"delta_survival_rtn{bits}_by_tensor.csv", rows)
-        write_csv(Path(args.output_dir) / "results" / f"delta_survival_rtn{bits}_by_block.csv", aggregate_by_block(rows))
-        shared_rows = shared_survival_by_bits[bits]
-        write_csv(Path(args.output_dir) / "results" / f"delta_survival_rtn{bits}_shared_grid_by_tensor.csv", shared_rows)
-        write_csv(Path(args.output_dir) / "results" / f"delta_survival_rtn{bits}_shared_grid_by_block.csv", aggregate_by_block(shared_rows))
+        write_csv(results_dir / f"delta_survival_rtn{bits}_by_tensor.csv", rows)
+        write_csv(results_dir / f"delta_survival_rtn{bits}_by_block.csv", aggregate_by_block(rows))
 
 
 
