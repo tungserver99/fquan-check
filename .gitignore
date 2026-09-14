@@ -45,4 +45,8 @@ Model-Fingerprint/stanford_alpaca/
 *.log
 wandb/
 runs/
-tensorboard/
+tensorboard/# RTN4 BASE-vs-IF generated experiment outputs
+quant_fp_phase1/rtn4_base_vs_if_analysis/
+quant_fp_phase1/*.zip
+*.parquet
+quant_fp_phase1.zip
