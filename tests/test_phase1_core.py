@@ -387,6 +387,15 @@ def test_base_fp_outputs_cli_accepts_rtn4_flag():
     assert args.group_size == 128
 
 
+def test_base_fp_outputs_cli_accepts_adjusted_fingerprint_lm_head_mode():
+    from quant_fp_phase1.scripts.run_base_fp_outputs import parse_args
+
+    args = parse_args(["--adjust-fingerprint-lm-head"])
+
+    assert args.rtn4 is True
+    assert args.adjust_fingerprint_lm_head is True
+    assert args.if_model == "cnut1648/LLaMA2-7B-fingerprinted-SFT"
+
 def test_quantize_base_model_rtn4_uses_phase1_rtn_config(monkeypatch):
     from quant_fp_phase1.scripts import run_base_fp_outputs
 
@@ -406,6 +415,53 @@ def test_quantize_base_model_rtn4_uses_phase1_rtn_config(monkeypatch):
     assert calls[0][1].bits == 4
     assert calls[0][1].group_size == 128
 
+
+def test_copy_lm_head_weight_from_base_model_replaces_fingerprint_weight():
+    from quant_fp_phase1.scripts.run_base_fp_outputs import copy_lm_head_weight_from_base_model
+
+    base = torch.nn.Module()
+    fingerprint = torch.nn.Module()
+    base.lm_head = torch.nn.Linear(3, 2, bias=False)
+    fingerprint.lm_head = torch.nn.Linear(3, 2, bias=False)
+    with torch.no_grad():
+        base.lm_head.weight.copy_(torch.arange(6, dtype=torch.float32).reshape(2, 3))
+        fingerprint.lm_head.weight.fill_(1.0)
+
+    copied = copy_lm_head_weight_from_base_model(fingerprint, base)
+
+    assert copied == "lm_head.weight"
+    assert torch.equal(fingerprint.lm_head.weight, base.lm_head.weight)
+
+
+def test_prepare_adjusted_fingerprint_quantizes_both_models_and_copies_base_lm_head(monkeypatch):
+    from quant_fp_phase1.scripts import run_base_fp_outputs
+
+    base = torch.nn.Module()
+    fingerprint = torch.nn.Module()
+    base.lm_head = torch.nn.Linear(2, 2, bias=False)
+    fingerprint.lm_head = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        base.lm_head.weight.fill_(7.0)
+        fingerprint.lm_head.weight.zero_()
+    calls = []
+
+    def fake_quantize(model, group_size):
+        calls.append((model, group_size))
+        return [f"{id(model)}.weight"]
+
+    monkeypatch.setattr(run_base_fp_outputs, "quantize_base_model_rtn4", fake_quantize)
+
+    result = run_base_fp_outputs.prepare_adjusted_fingerprint_with_base_lm_head(
+        fingerprint,
+        base,
+        group_size=64,
+    )
+
+    assert calls == [(base, 64), (fingerprint, 64)]
+    assert result.base_touched == [f"{id(base)}.weight"]
+    assert result.fingerprint_touched == [f"{id(fingerprint)}.weight"]
+    assert result.copied_lm_head == "lm_head.weight"
+    assert torch.equal(fingerprint.lm_head.weight, base.lm_head.weight)
 
 def test_rtn4_state_uses_existing_raw_rtn_with_phase1_config(monkeypatch):
     import torch
@@ -1086,3 +1142,84 @@ def test_behavior_diff_stages_release_each_model_before_loading_next(monkeypatch
     runner.run_analysis(args)
 
     assert active_counts_at_load == [0, 0]
+
+
+
+def test_cumulative_block_swap_plan_matches_spec():
+    from quant_fp_phase1.scripts.run_rtn4_cumulative_block_swap import build_initial_configs
+
+    configs = build_initial_configs(32)
+    ids = [config.config_id for config in configs]
+
+    assert ids[:2] == ["IF-RTN4", "BASE-RTN4"]
+    assert "P04" in ids and "P28" in ids
+    assert "S04" in ids and "S28" in ids
+    assert "D04" in ids and "D28" in ids
+    assert ids.count("ALL32") == 1
+    assert "P32" not in ids and "S32" not in ids and "D32" not in ids
+    assert next(config.blocks for config in configs if config.config_id == "P08") == tuple(range(8))
+    assert next(config.blocks for config in configs if config.config_id == "S08") == tuple(range(24, 32))
+    assert next(config.blocks for config in configs if config.config_id == "D04") == (0, 16, 8, 24)
+
+
+def test_cumulative_refinement_only_adds_transition_intervals():
+    from quant_fp_phase1.scripts.run_rtn4_cumulative_block_swap import refinement_configs
+
+    rows = [
+        {"family": "prefix", "num_swapped_blocks": 16, "verified_count": 8},
+        {"family": "prefix", "num_swapped_blocks": 20, "verified_count": 3},
+        {"family": "suffix", "num_swapped_blocks": 16, "verified_count": 8},
+        {"family": "suffix", "num_swapped_blocks": 20, "verified_count": 8},
+        {"family": "distributed", "num_swapped_blocks": 12, "verified_count": 8},
+        {"family": "distributed", "num_swapped_blocks": 16, "verified_count": 2},
+    ]
+
+    configs = refinement_configs(rows, 32)
+    ids = [config.config_id for config in configs]
+
+    assert ids == ["P17", "P18", "P19", "D13", "D14", "D15"]
+
+
+def test_apply_cumulative_block_swap_replaces_selected_blocks_and_restores_others():
+    import torch
+    from types import SimpleNamespace
+    from quant_fp_phase1.scripts.run_rtn4_cumulative_block_swap import apply_cumulative_block_swap, assert_cumulative_swap_state
+    from quant_fp_phase1.src.rtn4_quant_state import MODULE_TYPES, RTN4WeightState
+
+    class Attn(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(2, 1, bias=False)
+            self.k_proj = torch.nn.Linear(2, 1, bias=False)
+            self.v_proj = torch.nn.Linear(2, 1, bias=False)
+            self.o_proj = torch.nn.Linear(2, 1, bias=False)
+
+    class Mlp(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = torch.nn.Linear(2, 1, bias=False)
+            self.up_proj = torch.nn.Linear(2, 1, bias=False)
+            self.down_proj = torch.nn.Linear(2, 1, bias=False)
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = Attn()
+            self.mlp = Mlp()
+
+    model = torch.nn.Module()
+    model.model = SimpleNamespace(layers=torch.nn.ModuleList([Block(), Block()]))
+    base_states = {}
+    if_states = {}
+    for block_id in range(2):
+        for module_type in MODULE_TYPES:
+            parent = "self_attn" if module_type.endswith("_proj") and module_type in {"q_proj", "k_proj", "v_proj", "o_proj"} else "mlp"
+            name = f"model.layers.{block_id}.{parent}.{module_type}.weight"
+            if_value = torch.full((1, 2), float(block_id + 10))
+            base_value = torch.full((1, 2), float(block_id + 100))
+            if_states[name] = RTN4WeightState(name, block_id, module_type, torch.zeros((1, 2), dtype=torch.uint8), torch.ones((1, 1)), torch.zeros((1, 1)), if_value)
+            base_states[name] = RTN4WeightState(name, block_id, module_type, torch.zeros((1, 2), dtype=torch.uint8), torch.ones((1, 1)), torch.zeros((1, 1)), base_value)
+
+    replaced = apply_cumulative_block_swap(model, base_states, if_states, blocks=(1,))
+    assert len(replaced) == 7
+    assert_cumulative_swap_state(model, base_states, if_states, blocks=(1,))

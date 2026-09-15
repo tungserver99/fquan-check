@@ -1,6 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
+import gc
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -14,30 +16,76 @@ from quant_fp_phase1.src.quantization import RTNConfig, quantize_model_linear_we
 from quant_fp_phase1.src.runtime import ensure_model_fingerprint_on_path, load_causal_lm_and_tokenizer, set_seed
 
 
+@dataclass(frozen=True)
+class AdjustedFingerprintResult:
+    base_touched: list[str]
+    fingerprint_touched: list[str]
+    copied_lm_head: str
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Print base model outputs on IF-SFT fingerprint pairs."
+        description="Print model outputs on IF-SFT fingerprint pairs."
     )
     parser.add_argument("--base-model", default="NousResearch/Llama-2-7b-hf")
+    parser.add_argument("--if-model", default="cnut1648/LLaMA2-7B-fingerprinted-SFT")
     parser.add_argument("--fingerprint-data", default="Model-Fingerprint/dataset/llama_fingerprint_chat")
     parser.add_argument("--max-samples", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=30)
     parser.add_argument(
         "--rtn4",
         action="store_true",
-        help="Apply the Phase 1 RTN 4-bit path to the base model before generation.",
+        help="Apply the Phase 1 RTN 4-bit path before generation.",
+    )
+    parser.add_argument(
+        "--adjust-fingerprint-lm-head",
+        action="store_true",
+        help="Quantize base and IF models, copy base lm_head.weight into the IF model, then generate from the adjusted IF model.",
     )
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--dtype", default="bf16", choices=["auto", "fp16", "bf16", "fp32"])
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--target-y", default=DEFAULT_TARGET_Y)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.adjust_fingerprint_lm_head:
+        args.rtn4 = True
+    return args
 
 
 def quantize_base_model_rtn4(model: Any, group_size: int = 128) -> list[str]:
     config = RTNConfig(bits=4, group_size=group_size)
     return quantize_model_linear_weights(model, config)
+
+
+@torch.no_grad()
+def copy_lm_head_weight_from_base_model(fingerprint_model: Any, base_model: Any) -> str:
+    if not hasattr(base_model, "lm_head") or not hasattr(fingerprint_model, "lm_head"):
+        raise AttributeError("Both models must expose lm_head modules")
+    base_weight = base_model.lm_head.weight
+    fingerprint_weight = fingerprint_model.lm_head.weight
+    if base_weight.shape != fingerprint_weight.shape:
+        raise ValueError(
+            f"Cannot copy lm_head.weight: base shape {tuple(base_weight.shape)} != "
+            f"fingerprint shape {tuple(fingerprint_weight.shape)}"
+        )
+    fingerprint_weight.data.copy_(base_weight.detach().to(device=fingerprint_weight.device, dtype=fingerprint_weight.dtype))
+    return "lm_head.weight"
+
+
+def prepare_adjusted_fingerprint_with_base_lm_head(
+    fingerprint_model: Any,
+    base_model: Any,
+    group_size: int = 128,
+) -> AdjustedFingerprintResult:
+    base_touched = quantize_base_model_rtn4(base_model, group_size=group_size)
+    fingerprint_touched = quantize_base_model_rtn4(fingerprint_model, group_size=group_size)
+    copied_lm_head = copy_lm_head_weight_from_base_model(fingerprint_model, base_model)
+    return AdjustedFingerprintResult(
+        base_touched=base_touched,
+        fingerprint_touched=fingerprint_touched,
+        copied_lm_head=copied_lm_head,
+    )
 
 
 @torch.no_grad()
@@ -96,6 +144,12 @@ def print_output_row(row: dict[str, Any], variant: str) -> None:
     print(row["generated"])
 
 
+def clear_torch_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def main() -> None:
     args = parse_args()
     ensure_model_fingerprint_on_path(Path(__file__).resolve().parents[2])
@@ -109,21 +163,47 @@ def main() -> None:
     if not examples:
         raise SystemExit("No positive fingerprint examples found.")
 
-    variant = "BASE-RTN4" if args.rtn4 else "BASE-FP"
-    print(f"Model: {args.base_model}")
-    print(f"Variant: {variant}")
-    print(f"Fingerprint data: {args.fingerprint_data}")
-    print(f"Samples: {len(examples)}")
+    if args.adjust_fingerprint_lm_head:
+        variant = "IF-RTN4+BASE-LMHEAD"
+        print(f"Base model: {args.base_model}")
+        print(f"Fingerprint model: {args.if_model}")
+        print(f"Variant: {variant}")
+        print(f"Fingerprint data: {args.fingerprint_data}")
+        print(f"Samples: {len(examples)}")
 
-    model, tokenizer = load_causal_lm_and_tokenizer(args.base_model, args.dtype, args.device_map)
-    if args.rtn4:
-        touched = quantize_base_model_rtn4(model, group_size=args.group_size)
-        print(f"Applied Phase 1 RTN4: group_size={args.group_size}, quantized_tensors={len(touched)}")
+        base_model, _ = load_causal_lm_and_tokenizer(args.base_model, args.dtype, args.device_map)
+        fingerprint_model, tokenizer = load_causal_lm_and_tokenizer(args.if_model, args.dtype, args.device_map)
+        adjusted = prepare_adjusted_fingerprint_with_base_lm_head(
+            fingerprint_model,
+            base_model,
+            group_size=args.group_size,
+        )
+        print(
+            "Applied Phase 1 RTN4 to both models: "
+            f"group_size={args.group_size}, "
+            f"base_quantized_tensors={len(adjusted.base_touched)}, "
+            f"fingerprint_quantized_tensors={len(adjusted.fingerprint_touched)}"
+        )
+        print(f"Copied {adjusted.copied_lm_head}: BASE-RTN4 -> IF-RTN4")
+        del base_model
+        clear_torch_memory()
+        model = fingerprint_model
+    else:
+        variant = "BASE-RTN4" if args.rtn4 else "BASE-FP"
+        print(f"Model: {args.base_model}")
+        print(f"Variant: {variant}")
+        print(f"Fingerprint data: {args.fingerprint_data}")
+        print(f"Samples: {len(examples)}")
+
+        model, tokenizer = load_causal_lm_and_tokenizer(args.base_model, args.dtype, args.device_map)
+        if args.rtn4:
+            touched = quantize_base_model_rtn4(model, group_size=args.group_size)
+            print(f"Applied Phase 1 RTN4: group_size={args.group_size}, quantized_tensors={len(touched)}")
 
     for row in tqdm(
         iter_base_fingerprint_outputs(model, tokenizer, examples, args.target_y, args.max_new_tokens),
         total=len(examples),
-        desc="base fp outputs",
+        desc="fingerprint outputs",
     ):
         print_output_row(row, variant)
 
