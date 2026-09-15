@@ -1009,3 +1009,9 @@ def test_coordinate_row_table_preserves_coordinate_fields_without_pylist_dicts()
     assert rows[2]["base_scale"] == 2.0
     assert rows[2]["zero_point_diff"] == 2.0
     assert rows[2]["dequant_diff"] == 4.0
+
+def test_default_all_stage_reloads_models_between_diff_and_swaps_to_limit_peak_ram():
+    from quant_fp_phase1.scripts.run_rtn4_base_vs_if_analysis import parse_args, should_reload_models_between_diff_and_swaps
+
+    assert should_reload_models_between_diff_and_swaps(parse_args([])) is True
+    assert should_reload_models_between_diff_and_swaps(parse_args(["--stages", "diff"])) is False

@@ -555,6 +555,21 @@ def build_analysis_config_payload(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def has_stage(stages: set[str], name: str) -> bool:
+    return "all" in stages or name in stages
+
+
+def should_reload_models_between_diff_and_swaps(args: argparse.Namespace) -> bool:
+    stages = set(args.stages)
+    return has_stage(stages, "diff") and has_stage(stages, "swaps")
+
+
+def clear_torch_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def main() -> None:
     args = parse_args()
     ensure_model_fingerprint_on_path(Path(__file__).resolve().parents[2])
@@ -567,10 +582,16 @@ def main() -> None:
     write_json(results / "rtn4_analysis_config.json", build_analysis_config_payload(args))
 
     stages = set(args.stages)
-    need_models = bool({"all", "behavior", "diff", "swaps"} & stages)
+    run_behavior_stage = has_stage(stages, "behavior")
+    run_diff_stage = has_stage(stages, "diff")
+    run_plots_stage = has_stage(stages, "plots")
+    run_swaps_stage = has_stage(stages, "swaps")
+    run_summary_stage = has_stage(stages, "summary")
+    need_models = run_behavior_stage or run_diff_stage or run_swaps_stage
     examples = selected_fingerprint_examples(args) if need_models else []
     base_model = base_tok = base_states = None
     if_model = if_tok = if_states = None
+
     if need_models:
         print("Loading and quantizing BASE-FP -> BASE-RTN4 with Phase 1 RTN4")
         base_model, base_tok, base_states = load_rtn4_model_and_state(args.base_model, args)
@@ -578,22 +599,39 @@ def main() -> None:
         if_model, if_tok, if_states = load_rtn4_model_and_state(args.if_model, args)
         assert_matching_rtn4_states(base_states, if_states)
 
-    if "all" in stages or "behavior" in stages:
+    if run_behavior_stage:
         base_count, if_count = write_behavior_control(base_model, base_tok, if_model, if_tok, examples, args)
         print(f"Behavior control: BASE-RTN4={base_count}/8, IF-RTN4={if_count}/8")
-    if "all" in stages or "diff" in stages:
+
+    if run_diff_stage:
+        if base_model is not None or if_model is not None:
+            print("Releasing loaded models before exact diff to reduce PBS memory peak")
+            del base_model, if_model, base_tok, if_tok
+            base_model = if_model = base_tok = if_tok = None
+            clear_torch_memory()
         write_exact_diff_and_aggregates(base_states, if_states, args)
-    if "all" in stages or "plots" in stages:
+        if run_swaps_stage:
+            print("Releasing diff quant states before reloading models for swap analysis")
+            del base_states, if_states
+            base_states = if_states = None
+            clear_torch_memory()
+
+    if run_plots_stage:
         write_required_plots(results, plots)
-    if "all" in stages or "swaps" in stages:
+
+    if run_swaps_stage:
+        if base_model is None or if_model is None or base_states is None or if_states is None:
+            print("Reloading and quantizing models for swap analysis")
+            base_model, base_tok, base_states = load_rtn4_model_and_state(args.base_model, args)
+            if_model, if_tok, if_states = load_rtn4_model_and_state(args.if_model, args)
+            assert_matching_rtn4_states(base_states, if_states)
         run_swaps(base_model, if_model, if_tok, examples, args, base_states, if_states)
-    if "all" in stages or "summary" in stages:
+
+    if run_summary_stage:
         write_summary(args)
 
     del base_model, if_model, base_states, if_states
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    clear_torch_memory()
 
 
 if __name__ == "__main__":
