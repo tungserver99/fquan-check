@@ -257,6 +257,26 @@ def _push_top(heaps: dict[str, list[tuple[float, int, dict[str, Any]]]], metric:
         heapq.heapreplace(heap, item)
 
 
+def write_partial_diff_checkpoint(results: str | Path, tensor_rows: list[dict[str, Any]], heaps: dict[str, list[tuple[float, int, dict[str, Any]]]]) -> None:
+    results = Path(results)
+    if not tensor_rows:
+        return
+    block_rows = aggregate_numeric(tensor_rows, ["block_id"])
+    module_rows = aggregate_numeric(tensor_rows, ["module_type"])
+    block_module_rows = aggregate_numeric(tensor_rows, ["block_id", "module_type"])
+    write_csv(results / "rtn4_diff_by_tensor.partial.csv", sorted(tensor_rows, key=lambda row: (-row["qcode_diff_ratio"], -row["dequant_diff_l2"])))
+    write_csv(results / "rtn4_diff_by_block.partial.csv", block_rows)
+    write_csv(results / "rtn4_diff_by_module.partial.csv", module_rows)
+    write_csv(results / "rtn4_diff_by_block_module.partial.csv", block_module_rows)
+    for metric, filename in [
+        ("qcode_diff_ratio", "rtn4_diff_groups_top_by_qcode_ratio.partial.csv"),
+        ("dequant_diff_l2", "rtn4_diff_groups_top_by_l2.partial.csv"),
+        ("dequant_diff_max", "rtn4_diff_groups_top_by_maxdiff.partial.csv"),
+    ]:
+        top = [item[2] for item in sorted(heaps.get(metric, []), reverse=True)]
+        write_csv(results / filename, top)
+
+
 def write_exact_diff_and_aggregates(base_states: dict[str, Any], if_states: dict[str, Any], args: argparse.Namespace) -> None:
     assert_matching_rtn4_states(base_states, if_states)
     results = Path(args.output_dir) / "results"
@@ -284,6 +304,7 @@ def write_exact_diff_and_aggregates(base_states: dict[str, Any], if_states: dict
                     counter += 1
                     for metric in ("qcode_diff_ratio", "dequant_diff_l2", "dequant_diff_max"):
                         _push_top(heaps, metric, group_row, counter)
+                write_partial_diff_checkpoint(results, tensor_rows, heaps)
     finally:
         coord_writer.close()
         group_writer.close()

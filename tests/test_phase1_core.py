@@ -1086,3 +1086,32 @@ def test_behavior_diff_stages_release_each_model_before_loading_next(monkeypatch
     runner.run_analysis(args)
 
     assert active_counts_at_load == [0, 0]
+
+def test_partial_diff_checkpoint_writes_readable_csvs_before_final_parquet_closes(tmp_path):
+    from quant_fp_phase1.scripts.run_rtn4_base_vs_if_analysis import write_partial_diff_checkpoint
+    from quant_fp_phase1.src.rtn4_difference import write_csv
+
+    tensor_rows = [
+        {
+            "tensor_name": "model.layers.0.self_attn.q_proj.weight",
+            "block_id": 0,
+            "module_type": "q_proj",
+            "num_weights": 4,
+            "num_qcode_different": 2,
+            "qcode_diff_ratio": 0.5,
+            "dequant_diff_l1": 3.0,
+            "dequant_diff_l2": 2.0,
+            "dequant_diff_max": 1.5,
+            "dequant_diff_mean_abs": 0.75,
+        }
+    ]
+    heaps = {
+        "qcode_diff_ratio": [(1.0, 1, {"tensor_name": "t", "block_id": 0, "module_type": "q_proj", "output_row": 1, "group_id": 2, "qcode_diff_ratio": 1.0, "dequant_diff_l2": 2.0, "dequant_diff_max": 3.0})]
+    }
+
+    write_partial_diff_checkpoint(tmp_path, tensor_rows, heaps)
+
+    assert (tmp_path / "rtn4_diff_by_tensor.partial.csv").exists()
+    assert (tmp_path / "rtn4_diff_by_block.partial.csv").exists()
+    assert (tmp_path / "rtn4_diff_groups_top_by_qcode_ratio.partial.csv").exists()
+    assert "q_proj" in (tmp_path / "rtn4_diff_by_module.partial.csv").read_text(encoding="utf-8")
