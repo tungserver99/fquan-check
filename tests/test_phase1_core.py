@@ -1015,3 +1015,30 @@ def test_default_all_stage_reloads_models_between_diff_and_swaps_to_limit_peak_r
 
     assert should_reload_models_between_diff_and_swaps(parse_args([])) is True
     assert should_reload_models_between_diff_and_swaps(parse_args(["--stages", "diff"])) is False
+
+def test_rtn4_state_stores_qcode_as_uint8_for_memory_efficiency(monkeypatch):
+    import torch
+    from types import SimpleNamespace
+    from quant_fp_phase1.src import rtn4_quant_state
+
+    class FakeRawState:
+        original_dtype = torch.float32
+        in_features = 2
+        padded_in_features = 128
+        max_int = 15
+        pre_round = torch.tensor([[0.0, 15.0] + [0.0] * 126], dtype=torch.float32)
+        scale = torch.ones((1, 128), dtype=torch.float32)
+        zero_point = torch.zeros((1, 128), dtype=torch.float32)
+
+        def dequantize_truncated(self):
+            return torch.zeros((1, 2), dtype=torch.float32)
+
+    monkeypatch.setattr(rtn4_quant_state, "rtn_quantize_weight_raw", lambda *args, **kwargs: FakeRawState())
+
+    model = torch.nn.Module()
+    model.model = SimpleNamespace(layers=torch.nn.ModuleList([torch.nn.Sequential(torch.nn.Linear(2, 1, bias=False))]))
+
+    state = next(iter(rtn4_quant_state.quantize_rtn4_with_state(model, group_size=128).values()))
+
+    assert state.qcode.dtype == torch.uint8
+    assert state.qcode.tolist() == [[0, 15]]

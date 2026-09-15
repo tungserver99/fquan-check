@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from dataclasses import dataclass
@@ -82,7 +82,7 @@ def quantize_rtn4_with_state(
             continue
         weight = module.weight.detach().clone()
         raw = rtn_quantize_weight_raw(weight, bits=config.bits, group_size=config.group_size)
-        qcode = torch.round(raw.pre_round).clamp(0, raw.max_int).to(torch.int16)[:, : raw.in_features].cpu()
+        qcode = torch.round(raw.pre_round).clamp(0, raw.max_int).to(torch.uint8)[:, : raw.in_features].cpu()
         dequant = raw.dequantize_truncated().to(module.weight.dtype)
         with torch.no_grad():
             module.weight.data.copy_(dequant.to(module.weight.device))
