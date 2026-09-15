@@ -224,9 +224,7 @@ def assert_only_expected_swap(model: Any, if_states: dict[str, Any], base_states
         if not torch.equal(actual, expected.cpu()):
             raise RuntimeError(f"unexpected swap state for {tensor_name}")
 
-def write_behavior_control(base_model: Any, base_tok: Any, if_model: Any, if_tok: Any, examples: list[dict[str, Any]], args: argparse.Namespace) -> tuple[int, int]:
-    rows = behavior_rows("BASE-RTN4", base_model, base_tok, examples, args)
-    rows.extend(behavior_rows("IF-RTN4", if_model, if_tok, examples, args))
+def write_behavior_control_rows(rows: list[dict[str, Any]], args: argparse.Namespace) -> tuple[int, int]:
     path = Path(args.output_dir) / "results" / "rtn4_behavior_control.csv"
     write_csv(path, rows)
     base_count = verified_count(row for row in rows if row["model_variant"] == "BASE-RTN4")
@@ -237,6 +235,12 @@ def write_behavior_control(base_model: Any, base_tok: Any, if_model: Any, if_tok
             f"expected {args.expected_base_verified}/8 and {args.expected_if_verified}/8."
         )
     return base_count, if_count
+
+
+def write_behavior_control(base_model: Any, base_tok: Any, if_model: Any, if_tok: Any, examples: list[dict[str, Any]], args: argparse.Namespace) -> tuple[int, int]:
+    rows = behavior_rows("BASE-RTN4", base_model, base_tok, examples, args)
+    rows.extend(behavior_rows("IF-RTN4", if_model, if_tok, examples, args))
+    return write_behavior_control_rows(rows, args)
 
 
 def _push_top(heaps: dict[str, list[tuple[float, int, dict[str, Any]]]], metric: str, row: dict[str, Any], counter: int, limit: int = 100) -> None:
@@ -570,8 +574,7 @@ def clear_torch_memory() -> None:
         torch.cuda.empty_cache()
 
 
-def main() -> None:
-    args = parse_args()
+def run_analysis(args: argparse.Namespace) -> None:
     ensure_model_fingerprint_on_path(Path(__file__).resolve().parents[2])
     set_seed(args.seed)
     out = Path(args.output_dir)
@@ -592,23 +595,30 @@ def main() -> None:
     base_model = base_tok = base_states = None
     if_model = if_tok = if_states = None
 
-    if need_models:
+    if run_behavior_stage or run_diff_stage:
+        behavior_control_rows: list[dict[str, Any]] = []
         print("Loading and quantizing BASE-FP -> BASE-RTN4 with Phase 1 RTN4")
         base_model, base_tok, base_states = load_rtn4_model_and_state(args.base_model, args)
+        if run_behavior_stage:
+            behavior_control_rows.extend(behavior_rows("BASE-RTN4", base_model, base_tok, examples, args))
+        del base_model, base_tok
+        base_model = base_tok = None
+        clear_torch_memory()
+
         print("Loading and quantizing IF-FP -> IF-RTN4 with Phase 1 RTN4")
         if_model, if_tok, if_states = load_rtn4_model_and_state(args.if_model, args)
+        if run_behavior_stage:
+            behavior_control_rows.extend(behavior_rows("IF-RTN4", if_model, if_tok, examples, args))
+        del if_model, if_tok
+        if_model = if_tok = None
+        clear_torch_memory()
         assert_matching_rtn4_states(base_states, if_states)
 
-    if run_behavior_stage:
-        base_count, if_count = write_behavior_control(base_model, base_tok, if_model, if_tok, examples, args)
-        print(f"Behavior control: BASE-RTN4={base_count}/8, IF-RTN4={if_count}/8")
+        if run_behavior_stage:
+            base_count, if_count = write_behavior_control_rows(behavior_control_rows, args)
+            print(f"Behavior control: BASE-RTN4={base_count}/8, IF-RTN4={if_count}/8")
 
     if run_diff_stage:
-        if base_model is not None or if_model is not None:
-            print("Releasing loaded models before exact diff to reduce PBS memory peak")
-            del base_model, if_model, base_tok, if_tok
-            base_model = if_model = base_tok = if_tok = None
-            clear_torch_memory()
         write_exact_diff_and_aggregates(base_states, if_states, args)
         if run_swaps_stage:
             print("Releasing diff quant states before reloading models for swap analysis")
@@ -621,6 +631,10 @@ def main() -> None:
 
     if run_swaps_stage:
         if base_model is None or if_model is None or base_states is None or if_states is None:
+            if base_states is not None or if_states is not None:
+                del base_states, if_states
+                base_states = if_states = None
+                clear_torch_memory()
             print("Reloading and quantizing models for swap analysis")
             base_model, base_tok, base_states = load_rtn4_model_and_state(args.base_model, args)
             if_model, if_tok, if_states = load_rtn4_model_and_state(args.if_model, args)
@@ -632,6 +646,10 @@ def main() -> None:
 
     del base_model, if_model, base_states, if_states
     clear_torch_memory()
+
+
+def main() -> None:
+    run_analysis(parse_args())
 
 
 if __name__ == "__main__":

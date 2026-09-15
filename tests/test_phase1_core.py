@@ -1042,3 +1042,47 @@ def test_rtn4_state_stores_qcode_as_uint8_for_memory_efficiency(monkeypatch):
 
     assert state.qcode.dtype == torch.uint8
     assert state.qcode.tolist() == [[0, 15]]
+
+def test_behavior_diff_stages_release_each_model_before_loading_next(monkeypatch, tmp_path):
+    import torch
+    from quant_fp_phase1.scripts import run_rtn4_base_vs_if_analysis as runner
+    from quant_fp_phase1.src.rtn4_quant_state import RTN4WeightState
+
+    active_models = []
+    active_counts_at_load = []
+
+    class FakeConfig:
+        num_hidden_layers = 0
+
+    class FakeModel:
+        config = FakeConfig()
+
+        def __init__(self, name):
+            self.name = name
+            active_counts_at_load.append(len(active_models))
+            active_models.append(name)
+
+        def __del__(self):
+            if self.name in active_models:
+                active_models.remove(self.name)
+
+    def state(name):
+        return RTN4WeightState(
+            tensor_name="model.layers.0.self_attn.q_proj.weight",
+            block_id=0,
+            module_type="q_proj",
+            qcode=torch.zeros((1, 1), dtype=torch.uint8),
+            scale=torch.ones((1, 1)),
+            zero_point=torch.zeros((1, 1)),
+            dequant=torch.zeros((1, 1)),
+        )
+
+    monkeypatch.setattr(runner, "load_rtn4_model_and_state", lambda model_path, args: (FakeModel(model_path), object(), {"model.layers.0.self_attn.q_proj.weight": state(model_path)}))
+    monkeypatch.setattr(runner, "selected_fingerprint_examples", lambda args: [{"dataset_index": 0}])
+    monkeypatch.setattr(runner, "behavior_rows", lambda variant, model, tokenizer, examples, args: [{"sample_id": 0, "dataset_index": 0, "model_variant": variant, "verified": variant == "IF-RTN4", "generated_text": "x", "expected_text": "x"}])
+    monkeypatch.setattr(runner, "write_exact_diff_and_aggregates", lambda base_states, if_states, args: active_models == [] or (_ for _ in ()).throw(AssertionError("models should be released before diff")))
+
+    args = runner.parse_args(["--output-dir", str(tmp_path), "--stages", "behavior", "diff", "--no-strict-behavior-control"])
+    runner.run_analysis(args)
+
+    assert active_counts_at_load == [0, 0]
