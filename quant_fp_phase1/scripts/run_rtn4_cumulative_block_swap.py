@@ -59,6 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target-y", default=DEFAULT_TARGET_Y)
     parser.add_argument("--max-new-tokens", type=int, default=30)
     parser.add_argument("--no-refine", action="store_true", help="Run only the coarse counts from the spec.")
+    parser.add_argument("--only-all32", action="store_true", help="Run only the full transformer quantized-weight replacement from BASE-RTN4 into IF-RTN4.")
     return parser.parse_args(argv)
 
 
@@ -88,6 +89,11 @@ def build_initial_configs(n_blocks: int) -> list[SwapConfig]:
     configs.append(SwapConfig("ALL32", "all", tuple(range(n_blocks))))
     return configs
 
+
+def configs_for_run(args: argparse.Namespace, n_blocks: int) -> list[SwapConfig]:
+    if getattr(args, "only_all32", False):
+        return [SwapConfig("ALL32", "all", tuple(range(n_blocks)))]
+    return build_initial_configs(n_blocks)
 
 def _row_int(row: dict[str, Any], key: str) -> int:
     return int(float(row[key]))
@@ -319,12 +325,12 @@ def run_analysis(args: argparse.Namespace) -> None:
 
     rows: list[dict[str, Any]] = []
     generation_rows: list[dict[str, Any]] = []
-    for config in tqdm(build_initial_configs(n_blocks), desc="cumulative swaps"):
+    for config in tqdm(configs_for_run(args, n_blocks), desc="cumulative swaps"):
         row, gens = run_behavior_for_config(config, base_model, base_tok, if_model, if_tok, base_states, if_states, examples, args)
         rows.append(row)
         generation_rows.extend(gens)
 
-    if not args.no_refine:
+    if not args.no_refine and not args.only_all32:
         refine = refinement_configs(rows, n_blocks)
         for config in tqdm(refine, desc="cumulative refinements"):
             row, gens = run_behavior_for_config(config, base_model, base_tok, if_model, if_tok, base_states, if_states, examples, args)

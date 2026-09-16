@@ -1223,3 +1223,14 @@ def test_apply_cumulative_block_swap_replaces_selected_blocks_and_restores_other
     replaced = apply_cumulative_block_swap(model, base_states, if_states, blocks=(1,))
     assert len(replaced) == 7
     assert_cumulative_swap_state(model, base_states, if_states, blocks=(1,))
+
+
+def test_cumulative_runner_only_all32_selects_single_full_swap_config():
+    from quant_fp_phase1.scripts.run_rtn4_cumulative_block_swap import configs_for_run, parse_args
+
+    args = parse_args(["--only-all32"])
+    configs = configs_for_run(args, 32)
+
+    assert args.only_all32 is True
+    assert [config.config_id for config in configs] == ["ALL32"]
+    assert configs[0].blocks == tuple(range(32))
