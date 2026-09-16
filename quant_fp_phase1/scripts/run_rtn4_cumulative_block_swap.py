@@ -137,6 +137,21 @@ def reset_model_to_if_rtn4(model: Any, if_states: dict[str, Any]) -> None:
             layers[layer_name].weight.data.copy_(state.dequant.to(layers[layer_name].weight.device))
 
 
+def snapshot_lm_head_weight(model: Any) -> torch.Tensor | None:
+    if not hasattr(model, "lm_head"):
+        return None
+    return model.lm_head.weight.detach().cpu().clone()
+
+
+def assert_lm_head_unchanged(model: Any, expected: torch.Tensor | None) -> None:
+    if expected is None:
+        return
+    if not hasattr(model, "lm_head"):
+        raise RuntimeError("lm_head changed: model no longer exposes lm_head")
+    actual = model.lm_head.weight.detach().cpu()
+    if not torch.equal(actual, expected):
+        raise RuntimeError("lm_head changed during cumulative RTN4 swap")
+
 def _tensor_names_for_blocks(states: dict[str, Any], blocks: Iterable[int]) -> list[str]:
     block_set = set(int(block) for block in blocks)
     return sorted(name for name, state in states.items() if int(state.block_id) in block_set)
@@ -197,6 +212,7 @@ def run_behavior_for_config(
     if_states: dict[str, Any],
     examples: list[dict[str, Any]],
     args: argparse.Namespace,
+    if_lm_head_snapshot: torch.Tensor | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if config.config_id == "BASE-RTN4":
         behavior = behavior_rows(config.config_id, base_model, base_tok, examples, args)
@@ -210,6 +226,7 @@ def run_behavior_for_config(
             replaced = apply_cumulative_block_swap(if_model, base_states, if_states, config.blocks)
             print(f"{config.config_id}: replaced tensors = {len(replaced)}")
             assert_cumulative_swap_state(if_model, base_states, if_states, config.blocks)
+        assert_lm_head_unchanged(if_model, if_lm_head_snapshot)
         behavior = behavior_rows(config.config_id, if_model, if_tok, examples, args)
 
     count = verified_count(behavior)
@@ -322,18 +339,19 @@ def run_analysis(args: argparse.Namespace) -> None:
     if_model, if_tok, if_states = load_rtn4_model_and_state(args.if_model, args)
     assert_matching_rtn4_states(base_states, if_states)
     n_blocks = int(getattr(if_model.config, "num_hidden_layers"))
+    if_lm_head_snapshot = snapshot_lm_head_weight(if_model)
 
     rows: list[dict[str, Any]] = []
     generation_rows: list[dict[str, Any]] = []
     for config in tqdm(configs_for_run(args, n_blocks), desc="cumulative swaps"):
-        row, gens = run_behavior_for_config(config, base_model, base_tok, if_model, if_tok, base_states, if_states, examples, args)
+        row, gens = run_behavior_for_config(config, base_model, base_tok, if_model, if_tok, base_states, if_states, examples, args, if_lm_head_snapshot)
         rows.append(row)
         generation_rows.extend(gens)
 
     if not args.no_refine and not args.only_all32:
         refine = refinement_configs(rows, n_blocks)
         for config in tqdm(refine, desc="cumulative refinements"):
-            row, gens = run_behavior_for_config(config, base_model, base_tok, if_model, if_tok, base_states, if_states, examples, args)
+            row, gens = run_behavior_for_config(config, base_model, base_tok, if_model, if_tok, base_states, if_states, examples, args, if_lm_head_snapshot)
             rows.append(row)
             generation_rows.extend(gens)
 

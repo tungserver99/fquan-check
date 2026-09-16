@@ -1239,6 +1239,22 @@ def test_apply_cumulative_block_swap_replaces_selected_blocks_and_restores_other
     assert_cumulative_swap_state(model, base_states, if_states, blocks=(1,))
 
 
+def test_cumulative_swap_asserts_lm_head_is_unchanged():
+    import torch
+    from quant_fp_phase1.scripts.run_rtn4_cumulative_block_swap import assert_lm_head_unchanged, snapshot_lm_head_weight
+
+    model = torch.nn.Module()
+    model.lm_head = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        model.lm_head.weight.copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    snapshot = snapshot_lm_head_weight(model)
+    assert_lm_head_unchanged(model, snapshot)
+
+    with torch.no_grad():
+        model.lm_head.weight[0, 0] = 99.0
+    with pytest.raises(RuntimeError, match="lm_head changed"):
+        assert_lm_head_unchanged(model, snapshot)
+
 def test_cumulative_runner_only_all32_selects_single_full_swap_config():
     from quant_fp_phase1.scripts.run_rtn4_cumulative_block_swap import configs_for_run, parse_args
 
