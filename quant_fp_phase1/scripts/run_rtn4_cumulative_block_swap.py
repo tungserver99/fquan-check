@@ -60,6 +60,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=30)
     parser.add_argument("--no-refine", action="store_true", help="Run only the coarse counts from the spec.")
     parser.add_argument("--only-all32", action="store_true", help="Run only the full transformer quantized-weight replacement from BASE-RTN4 into IF-RTN4.")
+    parser.add_argument("--stdout-only", action="store_true", help="Print generations to stdout and do not write result files.")
     return parser.parse_args(argv)
 
 
@@ -89,6 +90,25 @@ def build_initial_configs(n_blocks: int) -> list[SwapConfig]:
     configs.append(SwapConfig("ALL32", "all", tuple(range(n_blocks))))
     return configs
 
+
+def should_write_outputs(args: argparse.Namespace) -> bool:
+    return not getattr(args, "stdout_only", False)
+
+
+def print_stdout_summary(row: dict[str, Any], generation_rows: list[dict[str, Any]]) -> None:
+    total = len(generation_rows)
+    print("=" * 88)
+    print(f"{row['config_id']} verified_count={row['verified_count']}/{total}")
+    for item in generation_rows:
+        print("=" * 88)
+        print(
+            f"sample_id={item['sample_id']} | dataset_index={item['dataset_index']} | "
+            f"verified={item['verified']}"
+        )
+        print("EXPECTED:")
+        print(item["expected_text"])
+        print("GENERATED:")
+        print(item["generated_text"])
 
 def configs_for_run(args: argparse.Namespace, n_blocks: int) -> list[SwapConfig]:
     if getattr(args, "only_all32", False):
@@ -328,7 +348,8 @@ def run_analysis(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     out = Path(args.output_dir)
     results = out / "results"
-    results.mkdir(parents=True, exist_ok=True)
+    if should_write_outputs(args):
+        results.mkdir(parents=True, exist_ok=True)
     examples = selected_fingerprint_examples(args)
     if len(examples) != 8:
         raise RuntimeError(f"Expected 8 fingerprint examples, found {len(examples)}")
@@ -355,10 +376,15 @@ def run_analysis(args: argparse.Namespace) -> None:
             rows.append(row)
             generation_rows.extend(gens)
 
-    write_csv(results / "rtn4_cumulative_block_swap.csv", rows)
-    write_csv(results / "rtn4_cumulative_block_swap_generations.csv", generation_rows)
-    write_cumulative_plot(rows, out)
-    write_summary(rows, out)
+    if should_write_outputs(args):
+        write_csv(results / "rtn4_cumulative_block_swap.csv", rows)
+        write_csv(results / "rtn4_cumulative_block_swap_generations.csv", generation_rows)
+        write_cumulative_plot(rows, out)
+        write_summary(rows, out)
+    else:
+        for row in rows:
+            config_generations = [item for item in generation_rows if item["config_id"] == row["config_id"]]
+            print_stdout_summary(row, config_generations)
     del base_model, if_model, base_states, if_states
     clear_torch_memory()
 

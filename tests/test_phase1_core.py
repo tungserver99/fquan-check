@@ -1255,6 +1255,32 @@ def test_cumulative_swap_asserts_lm_head_is_unchanged():
     with pytest.raises(RuntimeError, match="lm_head changed"):
         assert_lm_head_unchanged(model, snapshot)
 
+def test_cumulative_runner_stdout_only_disables_file_outputs():
+    from quant_fp_phase1.scripts.run_rtn4_cumulative_block_swap import parse_args, should_write_outputs
+
+    args = parse_args(["--only-all32", "--stdout-only"])
+
+    assert args.stdout_only is True
+    assert should_write_outputs(args) is False
+
+
+def test_stdout_generation_summary_prints_all_samples(capsys):
+    from quant_fp_phase1.scripts.run_rtn4_cumulative_block_swap import print_stdout_summary
+
+    row = {"config_id": "ALL32", "verified_count": 2}
+    generations = [
+        {"sample_id": idx, "dataset_index": idx + 10, "verified": idx < 2, "expected_text": "target", "generated_text": f"out-{idx}"}
+        for idx in range(8)
+    ]
+
+    print_stdout_summary(row, generations)
+    out = capsys.readouterr().out
+
+    assert "ALL32 verified_count=2/8" in out
+    assert out.count("GENERATED:") == 8
+    assert "sample_id=7" in out
+    assert "out-7" in out
+
 def test_cumulative_runner_only_all32_selects_single_full_swap_config():
     from quant_fp_phase1.scripts.run_rtn4_cumulative_block_swap import configs_for_run, parse_args
 
