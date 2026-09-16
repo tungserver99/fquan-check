@@ -433,6 +433,20 @@ def test_copy_lm_head_weight_from_base_model_replaces_fingerprint_weight():
     assert torch.equal(fingerprint.lm_head.weight, base.lm_head.weight)
 
 
+def test_copy_lm_head_weight_from_cpu_tensor_replaces_fingerprint_weight():
+    from quant_fp_phase1.scripts.run_base_fp_outputs import copy_lm_head_weight_from_tensor
+
+    fingerprint = torch.nn.Module()
+    fingerprint.lm_head = torch.nn.Linear(3, 2, bias=False)
+    source = torch.arange(6, dtype=torch.float32).reshape(2, 3).cpu()
+    with torch.no_grad():
+        fingerprint.lm_head.weight.fill_(1.0)
+
+    copied = copy_lm_head_weight_from_tensor(fingerprint, source)
+
+    assert copied == "lm_head.weight"
+    assert torch.equal(fingerprint.lm_head.weight.cpu(), source)
+
 def test_prepare_adjusted_fingerprint_quantizes_both_models_and_copies_base_lm_head(monkeypatch):
     from quant_fp_phase1.scripts import run_base_fp_outputs
 

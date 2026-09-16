@@ -59,18 +59,29 @@ def quantize_base_model_rtn4(model: Any, group_size: int = 128) -> list[str]:
 
 
 @torch.no_grad()
-def copy_lm_head_weight_from_base_model(fingerprint_model: Any, base_model: Any) -> str:
-    if not hasattr(base_model, "lm_head") or not hasattr(fingerprint_model, "lm_head"):
-        raise AttributeError("Both models must expose lm_head modules")
-    base_weight = base_model.lm_head.weight
+def extract_lm_head_weight_cpu(model: Any) -> torch.Tensor:
+    if not hasattr(model, "lm_head"):
+        raise AttributeError("Model must expose an lm_head module")
+    return model.lm_head.weight.detach().cpu().clone()
+
+
+@torch.no_grad()
+def copy_lm_head_weight_from_tensor(fingerprint_model: Any, source_weight: torch.Tensor) -> str:
+    if not hasattr(fingerprint_model, "lm_head"):
+        raise AttributeError("Fingerprint model must expose an lm_head module")
     fingerprint_weight = fingerprint_model.lm_head.weight
-    if base_weight.shape != fingerprint_weight.shape:
+    if source_weight.shape != fingerprint_weight.shape:
         raise ValueError(
-            f"Cannot copy lm_head.weight: base shape {tuple(base_weight.shape)} != "
+            f"Cannot copy lm_head.weight: source shape {tuple(source_weight.shape)} != "
             f"fingerprint shape {tuple(fingerprint_weight.shape)}"
         )
-    fingerprint_weight.data.copy_(base_weight.detach().to(device=fingerprint_weight.device, dtype=fingerprint_weight.dtype))
+    fingerprint_weight.data.copy_(source_weight.to(device=fingerprint_weight.device, dtype=fingerprint_weight.dtype))
     return "lm_head.weight"
+
+
+@torch.no_grad()
+def copy_lm_head_weight_from_base_model(fingerprint_model: Any, base_model: Any) -> str:
+    return copy_lm_head_weight_from_tensor(fingerprint_model, extract_lm_head_weight_cpu(base_model))
 
 
 def prepare_adjusted_fingerprint_with_base_lm_head(
@@ -172,21 +183,22 @@ def main() -> None:
         print(f"Samples: {len(examples)}")
 
         base_model, _ = load_causal_lm_and_tokenizer(args.base_model, args.dtype, args.device_map)
-        fingerprint_model, tokenizer = load_causal_lm_and_tokenizer(args.if_model, args.dtype, args.device_map)
-        adjusted = prepare_adjusted_fingerprint_with_base_lm_head(
-            fingerprint_model,
-            base_model,
-            group_size=args.group_size,
-        )
-        print(
-            "Applied Phase 1 RTN4 to both models: "
-            f"group_size={args.group_size}, "
-            f"base_quantized_tensors={len(adjusted.base_touched)}, "
-            f"fingerprint_quantized_tensors={len(adjusted.fingerprint_touched)}"
-        )
-        print(f"Copied {adjusted.copied_lm_head}: BASE-RTN4 -> IF-RTN4")
+        base_touched = quantize_base_model_rtn4(base_model, group_size=args.group_size)
+        base_lm_head_weight = extract_lm_head_weight_cpu(base_model)
+        print(f"Applied Phase 1 RTN4 to base: group_size={args.group_size}, quantized_tensors={len(base_touched)}")
         del base_model
         clear_torch_memory()
+
+        fingerprint_model, tokenizer = load_causal_lm_and_tokenizer(args.if_model, args.dtype, args.device_map)
+        fingerprint_touched = quantize_base_model_rtn4(fingerprint_model, group_size=args.group_size)
+        copied_lm_head = copy_lm_head_weight_from_tensor(fingerprint_model, base_lm_head_weight)
+        del base_lm_head_weight
+        clear_torch_memory()
+        print(
+            "Applied Phase 1 RTN4 to fingerprint: "
+            f"group_size={args.group_size}, quantized_tensors={len(fingerprint_touched)}"
+        )
+        print(f"Copied {copied_lm_head}: BASE-RTN4 -> IF-RTN4")
         model = fingerprint_model
     else:
         variant = "BASE-RTN4" if args.rtn4 else "BASE-FP"
